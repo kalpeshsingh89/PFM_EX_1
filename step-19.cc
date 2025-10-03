@@ -4,6 +4,7 @@
 #include <deal.II/base/timer.h>
 #include <deal.II/base/tensor.h>
 #include <deal.II/base/utilities.h>
+#include <deal.II/base/symmetric_tensor.h>
 
 #include <deal.II/lac/affine_constraints.h>
 #include <deal.II/lac/dynamic_sparsity_pattern.h>
@@ -13,7 +14,7 @@
 
 #include <deal.II/grid/grid_generator.h>
 #include <deal.II/grid/grid_refinement.h>
-#include <deal.II/base/symmetric_tensor.h>
+
 #include <deal.II/dofs/dof_handler.h>
 #include <deal.II/dofs/dof_tools.h>
 
@@ -31,6 +32,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <cmath>
 
 using namespace dealii;
 
@@ -107,6 +109,10 @@ private:
   bool   use_AT1;
   double cw;
 
+  // plate thickness and external traction (N/m^2)
+  double thickness;
+  Tensor<1,dim> applied_traction;
+
   // loading
   unsigned int n_steps;
   double delta_max;
@@ -126,36 +132,25 @@ private:
 };
 
 
-
-
-
-
-
-
-
 // ----------------- IMPLEMENTATION -----------------
 
-
-
-
-
-
-//SEGMENT - 1
 template <int dim>
 PhaseFieldMonolithicConsistentAMR<dim>::PhaseFieldMonolithicConsistentAMR()
   : fe_u(FE_Q<dim>(fe_u_order), dim)
   , dof_handler_u(triangulation)
   , fe_phi(fe_phi_order)
   , dof_handler_phi(triangulation)
-  , E(210e3)
-  , nu(0.31)
-  , Gc(2.5)
-  , ell(0.05)
+  , E(210e9)           // Pa
+  , nu(0.30)
+  , Gc(1000.0)         // J/m^2 (example)
+  , ell(0.005)         // m
   , kappa(1e-7)
   , use_AT1(true)
   , cw(use_AT1 ? 2.0/3.0 : 1.0/2.0)
-  , n_steps(200)        // smaller load increments for robustness
-  , delta_max(0.3)
+  , thickness(0.1)     // m
+  , applied_traction()
+  , n_steps(200)
+  , delta_max(0.0)     // use traction-controlled ramp, delta_max not used here
   , max_newton_iter(50)
   , tol_newton(1e-8)
   , refine_every(2)
@@ -167,20 +162,15 @@ PhaseFieldMonolithicConsistentAMR<dim>::PhaseFieldMonolithicConsistentAMR()
   mu     = E / (2.0 * (1.0 + nu));
 }
 
-
-
-
-
-
-//SEGMENT - 2
 template <int dim>
 void PhaseFieldMonolithicConsistentAMR<dim>::make_grid()
 {
   const double W = 2.0;
   const double H = 2.0;
 
+  // initial subdivisions. Increase for better resolution (costly).
   GridGenerator::subdivided_hyper_rectangle(triangulation,
-                                            {50U, 50U},
+                                            {100U, 100U},
                                             Point<dim>(0.0, 0.0),
                                             Point<dim>(W, H));
 
@@ -189,17 +179,13 @@ void PhaseFieldMonolithicConsistentAMR<dim>::make_grid()
       if (cell->face(f)->at_boundary())
       {
         const auto c = cell->face(f)->center();
-        if (std::fabs(c[0] - 0.0) < 1e-12) cell->face(f)->set_boundary_id(0); // left
-        else if (std::fabs(c[0] - W) < 1e-12) cell->face(f)->set_boundary_id(1); // right
+        if (std::fabs(c[1] - 0.0) < 1e-12) cell->face(f)->set_boundary_id(0); // bottom (fixed)
+        else if (std::fabs(c[1] - H) < 1e-12) cell->face(f)->set_boundary_id(1); // top (traction)
+        else if (std::fabs(c[0] - 0.0) < 1e-12) cell->face(f)->set_boundary_id(2); // left (free)
+        else if (std::fabs(c[0] - W) < 1e-12) cell->face(f)->set_boundary_id(3); // right (free)
       }
 }
 
-
-
-
-
-
-//SEGMENT - 3
 template <int dim>
 void PhaseFieldMonolithicConsistentAMR<dim>::setup_system()
 {
@@ -211,10 +197,11 @@ void PhaseFieldMonolithicConsistentAMR<dim>::setup_system()
   system_size    = dofs_u_total + dofs_phi_total;
 
   constraints_u.clear();
+  // bottom boundary id = 0 -> fixed ux = uy = 0
   VectorTools::interpolate_boundary_values(dof_handler_u,
                                            0,
                                            Functions::ZeroFunction<dim>(dim),
-                                           constraints_u); // left fixed
+                                           constraints_u);
   constraints_u.close();
 
   constraints_phi.clear(); // natural BC for phi
@@ -254,38 +241,31 @@ void PhaseFieldMonolithicConsistentAMR<dim>::setup_system()
   history_H.reinit(dofs_phi_total);
 }
 
-
-
-
-
-
-//SEGMENT - 4
 template <int dim>
 void PhaseFieldMonolithicConsistentAMR<dim>::initialize_fields()
 {
-  // initial slit band (phi=1) around y ~ 2.5 and x < 2.0
   MappingQ1<dim> mapping;
   std::vector<Point<dim>> sp(dof_handler_phi.n_dofs());
   DoFTools::map_dofs_to_support_points(mapping, dof_handler_phi, sp);
 
+  // crack centered at (0,1) extending in +x of length 0.01
+  const double crack_x0 = 0.0;
+  const double crack_y  = 1.0;
+  const double crack_len = 0.01;
+  const double band_half = std::max(0.5e-3, 0.5 * ell); // small width around crack line
+
   for (unsigned int i=0; i<sp.size(); ++i)
   {
     const auto &p = sp[i];
-    // domain y in [0,2], place band near y = 1.0
-    const bool in_band = (p[1] > 0.95) && (p[1] < 1.05) && (p[0] < 1.0);
-    solution_phi[i]     = in_band ? 1.0 : 0.0;
+    const bool along_crack = (p[0] >= crack_x0) && (p[0] <= crack_x0 + crack_len);
+    const bool near_line = std::fabs(p[1] - crack_y) < band_half;
+    solution_phi[i]     = (along_crack && near_line) ? 1.0 : 0.0;
     old_solution_phi[i] = solution_phi[i];
     history_H[i]        = 0.0;
   }
   solution_u = 0.0;
 }
 
-
-
-
-
-
-//SEGMENT - 5
 template <int dim>
 double PhaseFieldMonolithicConsistentAMR<dim>::psi_plus(
     const SymmetricTensor<2,dim> &eps) const
@@ -304,12 +284,6 @@ double PhaseFieldMonolithicConsistentAMR<dim>::psi_full(
   return 0.5*lambda*tr*tr + mu*(eps*eps);
 }
 
-
-
-
-
-
-//SEGMENT - 6
 template <int dim>
 void PhaseFieldMonolithicConsistentAMR<dim>::assemble_residual_and_jacobian()
 {
@@ -378,7 +352,7 @@ void PhaseFieldMonolithicConsistentAMR<dim>::assemble_residual_and_jacobian()
       const double wprime_q  = w_prime(phi_q);
       const double wdouble_q = w_double(phi_q);
 
-      const double JxW = fev_u.JxW(q);
+      const double JxW = fev_u.JxW(q) * thickness;
       const double factor = Gc / (2.0 * cw * ell);
 
       // precompute shape data
@@ -480,18 +454,45 @@ void PhaseFieldMonolithicConsistentAMR<dim>::assemble_residual_and_jacobian()
     }
   }
 
+  // Assemble Neumann (traction) on top boundary (boundary id = 1)
+  {
+    const QGauss<dim-1> face_quad(fe_u.degree + 1);
+    FEFaceValues<dim> fe_face(fe_u, face_quad, update_values | update_quadrature_points | update_JxW_values);
+    const FEValuesExtractors::Vector U(0);
+
+    std::vector<types::global_dof_index> local_dof_indices(fe_u.n_dofs_per_cell());
+
+    for (auto cell = dof_handler_u.begin_active(); cell != dof_handler_u.end(); ++cell)
+    {
+      for (unsigned int f=0; f<GeometryInfo<dim>::faces_per_cell; ++f)
+        if (cell->face(f)->at_boundary() && cell->face(f)->boundary_id() == 1)
+        {
+          fe_face.reinit(cell, f);
+          cell->get_dof_indices(local_dof_indices);
+          const unsigned int n_q_face = face_quad.size();
+
+          for (unsigned int q=0; q<n_q_face; ++q)
+          {
+            const double JxW_face = fe_face.JxW(q) * thickness;
+            for (unsigned int i=0; i<fe_u.n_dofs_per_cell(); ++i)
+            {
+              const auto Gi = local_dof_indices[i];
+              const Tensor<1,dim> Ni = fe_face[U].value(i,q);
+              double add = 0.0;
+              for (unsigned int d=0; d<dim; ++d)
+                add += Ni[d] * applied_traction[d] * JxW_face;
+              system_residual[Gi] += add;
+            }
+          }
+        }
+    }
+  }
+
   // constraints
   constraints_u.condense(system_jacobian, system_residual);
   constraints_phi.condense(system_jacobian, system_residual);
 }
 
-
-
-
-
-
-
-//SEGMENT - 7
 template <int dim>
 void PhaseFieldMonolithicConsistentAMR<dim>::solve_linear_system()
 {
@@ -504,12 +505,6 @@ void PhaseFieldMonolithicConsistentAMR<dim>::solve_linear_system()
   constraints_phi.distribute(system_delta);
 }
 
-
-
-
-
-
-//SEGMENT - 8
 template <int dim>
 void PhaseFieldMonolithicConsistentAMR<dim>::update_solution_and_enforce_bounds(const double alpha)
 {
@@ -524,12 +519,6 @@ void PhaseFieldMonolithicConsistentAMR<dim>::update_solution_and_enforce_bounds(
   }
 }
 
-
-
-
-
-
-//SEGMENT - 9
 template <int dim>
 void PhaseFieldMonolithicConsistentAMR<dim>::update_history_field()
 {
@@ -569,7 +558,7 @@ void PhaseFieldMonolithicConsistentAMR<dim>::update_history_field()
         eps_q += fev_u[U].symmetric_gradient(i,q) * u_loc[i];
 
       const double psi_q = use_tension_split ? psi_plus(eps_q) : psi_full(eps_q);
-      const double JxW   = fev_u.JxW(q);
+      const double JxW   = fev_u.JxW(q) * thickness;
 
       for (unsigned int i=0; i<np; ++i)
       {
@@ -587,12 +576,6 @@ void PhaseFieldMonolithicConsistentAMR<dim>::update_history_field()
   }
 }
 
-
-
-
-
-
-//SEGMENT - 10
 template <int dim>
 void PhaseFieldMonolithicConsistentAMR<dim>::output_results(const unsigned int cycle) const
 {
@@ -626,12 +609,6 @@ void PhaseFieldMonolithicConsistentAMR<dim>::output_results(const unsigned int c
   pvd << "  </Collection>\n</VTKFile>\n";
 }
 
-
-
-
-
-
-//SEGMENT - 11
 template <int dim>
 void PhaseFieldMonolithicConsistentAMR<dim>::refine_mesh(unsigned int /*refine_cycle*/)
 {
@@ -657,40 +634,27 @@ void PhaseFieldMonolithicConsistentAMR<dim>::refine_mesh(unsigned int /*refine_c
     if ((int)cell->level() <= min_level)   cell->clear_coarsen_flag();
   }
 
-  // --- replace your refine_mesh() transfer block ---
-
-  // BEFORE CC&R
+  // solution transfer
   SolutionTransfer<dim, Vector<double>> tr_u(dof_handler_u);
   SolutionTransfer<dim, Vector<double>> tr_p(dof_handler_phi);
 
   tr_u.prepare_for_coarsening_and_refinement(solution_u);
 
-  // prepare BOTH phi and H with a single transferor
   std::vector<const Vector<double>*> phiH_src = { &solution_phi, &history_H };
   tr_p.prepare_for_coarsening_and_refinement(phiH_src);
 
   triangulation.execute_coarsening_and_refinement();
 
-  // DO NOT call distribute_dofs manually here; setup_system() does it safely
-  setup_system();  // this redistributes DoFs and resizes vectors
+  setup_system();  // redistribute DoFs and resize vectors
 
-  // interpolate back
   tr_u.interpolate(solution_u);
 
   std::vector<Vector<double>*> phiH_dst = { &solution_phi, &history_H };
   tr_p.interpolate(phiH_dst);
 
-  // keep irreversibility
   old_solution_phi = solution_phi;
-
 }
 
-
-
-
-
-
-//SEGMENT - 12
 template <int dim>
 void PhaseFieldMonolithicConsistentAMR<dim>::run()
 {
@@ -701,38 +665,29 @@ void PhaseFieldMonolithicConsistentAMR<dim>::run()
 
   for (unsigned int step=1; step<=n_steps; ++step)
   {
-    const double disp = (double)step * delta_max / (double)n_steps;
+    // ramp traction linearly with step
+    const double total_F = 10000.0; // N (total force on top edge)
+    const double top_length = 2.0;  // m
+    const double t_y = (total_F * (double)step / (double)n_steps) / (top_length * thickness);
+    applied_traction = Tensor<1,dim>();
+    applied_traction[0] = 0.0;
+    applied_traction[1] = -t_y; // negative -> downward; change sign if needed
 
-    // BCs: left fixed; right impose uy=disp, ux free
-    class RightDisp : public Function<dim>
-    {
-    public:
-      RightDisp(double v) : Function<dim>(dim), val(v) {}
-      void vector_value(const Point<dim> &, Vector<double> &v) const override
-      { v = 0.0; v[1] = val; }
-      double val;
-    } right_disp(disp);
-
+    // enforce bottom BCs (id 0)
     constraints_u.clear();
-    VectorTools::interpolate_boundary_values(dof_handler_u, 0,
-                                             Functions::ZeroFunction<dim>(dim),
-                                             constraints_u);
-    VectorTools::interpolate_boundary_values(dof_handler_u, 1,
-                                             right_disp, constraints_u);
+    VectorTools::interpolate_boundary_values(dof_handler_u, 0, Functions::ZeroFunction<dim>(dim), constraints_u);
     constraints_u.close();
 
-    // store φ_old; update H from current u
     old_solution_phi = solution_phi;
     update_history_field();
 
-    // --- Newton ---
+    // Newton loop
     bool converged = false;
     for (unsigned int it=0; it<max_newton_iter; ++it)
     {
       assemble_residual_and_jacobian();
       const double R0 = system_residual.l2_norm();
-      std::cout << "Step " << step << " Newton " << it
-                << " ||R|| = " << R0 << std::endl;
+      std::cout << "Step " << step << " Newton " << it << " ||R|| = " << R0 << std::endl;
 
       if (R0 < tol_newton) { converged = true; break; }
 
@@ -747,7 +702,7 @@ void PhaseFieldMonolithicConsistentAMR<dim>::run()
       const double rel_inc = std::sqrt(du_norm+dp_norm) / (1e-16 + std::sqrt(u_norm+p_norm));
       if (rel_inc < 1e-10) { converged = true; break; }
 
-      // backtracking
+      // backtracking line search
       double alpha = 1.0, best_alpha = 0.0;
       double best_R = R0;
       const double rho = 0.5;
@@ -787,7 +742,7 @@ void PhaseFieldMonolithicConsistentAMR<dim>::run()
         solution_u = save_u; solution_phi = save_p;
         update_solution_and_enforce_bounds(best_alpha);
       }
-    } // <-- closes Newton loop
+    } // Newton
 
     if (!converged)
       std::cout << "Warning: Newton did not converge in step " << step << "\n";
@@ -800,15 +755,8 @@ void PhaseFieldMonolithicConsistentAMR<dim>::run()
       refine_mesh(step/refine_every);
       output_results(step);
     }
-  } // <-- closes step loop
-}   // <-- closes run()
-
-///////////////////////////////////////////////////
-
-
-
-
-
+  } // load steps
+} // run()
 
 
 int main()
