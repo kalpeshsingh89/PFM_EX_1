@@ -1,8 +1,40 @@
+# ---- Build system files ----
 build/
 CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake
-Makefile
 compile_commands.json
+Makefile
+*.ninja
+.ninja_deps
+.ninja_log
+
+# ---- Deal.II generated outputs ----
 *.vtu
+*.pvtu
 *.pvd
+*.vtk
+*.h5
+*.xdmf
+
+# ---- Logs and temporary files ----
+*.log
+*.out
+*.err
+*.tmp
+
+# ---- OS / Editor junk ----
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.bak
+
+# ---- Binary executables ----
+step-*
+*.exe
+*.out
+*.o
+*.so
+*.a
+
